@@ -22,8 +22,10 @@ Google Flights loads results client-side. The reliable method is:
 1. Launch headless Chromium/Edge with a real desktop UA and `--disable-blink-features=AutomationControlled`.
 2. Hide the `navigator.webdriver` flag via `add_init_script` to look like a normal browser.
 3. Navigate to a deep-link URL that encodes the query (origin, destination, dates, currency).
-4. Wait for the results to render, then read the `li` result cards from the page.
-5. Parse each card's text for price, route, duration, stops, and airline names.
+4. Wait for the results to render.
+5. Verify the trip type on the page (see "Trip type" above) - confirm one-way vs round trip and the exact return date if any.
+6. Read the `li` result cards from the page.
+7. Parse each card's text for price, route, duration, stops, and airline names.
 
 ### The deep-link URL format
 Use the `q` query parameter to encode the search. This avoids fighting the on-page form:
@@ -33,6 +35,13 @@ https://www.google.com/travel/flights?hl=en&curr=USD&q=flights from SFO to TYO o
 - `hl=en` -> English UI (keeps parsing stable).
 - `curr=USD` -> prices in USD.
 - `q=flights from <ORIGIN> to <DEST> on <YYYY-MM-DD> return <YYYY-MM-DD>`.
+
+### Trip type: ALWAYS say it explicitly (one-way vs round trip)
+The single most expensive gotcha. If the `q` string has `on <date>` but NO `return`, Google Flights does **not** treat it as one-way. It silently defaults to a round trip and auto-selects a return date (observed: departure + 4 days). You will scrape round-trip prices while believing they are one-way fares - the numbers are roughly double, and any comparison/summary you report is wrong.
+
+- For one-way fares, write the trip type explicitly: `q=flights from SFO to SEA on 2027-03-03 one way` (`one-way` also works).
+- For round trips, always include the exact return date: `q=... on 2027-03-03 return 2027-03-07`. Never rely on the implicit default return date; it varies and changes the price. In scripts, prefer an explicit `--return <date>` flag that both builds the URL and validates the rendered page (see `gf_sweep_v2.py`).
+- ALWAYS verify the trip type after results render, before parsing/reporting: scan the body text for `One-way` vs `Round trip`, and for the `returning YYYY-MM-DD` string (e.g. "Track prices from SFO to SEA departing 2027-03-03 and returning 2027-03-07"). If you asked for one-way but the page says `Round trip` with a `returning ...` date, the prices are round-trip fares - fix the URL and re-fetch. Never report a price without knowing which it is.
 
 ### Switching cabin (economy -> business)
 Google Flights defaults to Economy. To get Business results, click the visible "Economy" select, then click the visible "Business" item, and wait for the page to reload results:
@@ -69,9 +78,26 @@ Save results as JSON keyed by a query descriptor, e.g.:
 5. If the user wants a summary, compute per-query min price and per-airline hit counts.
 
 ## Example
-See `scripts/gf_sweep.py` for a complete working sweep (SFO -> TYO/TPE across 2 date windows, economy + business, filtered to JL/NH). Adapt the `ORIGIN`, `WINDOWS`, `DESTINATIONS`, `CABINS`, and `UID` maps to the user's request.
+See `scripts/gf_sweep_v2.py` for a generic CLI sweeper with extra modes:
+- **Morning cutoff filter**: `--cutoff 12:00` keeps only flights departing before noon (times normalized to minutes, 12h/24h both supported).
+- **Round-trip mode**: `--return 2027-03-10` adds `return <date>` to the query; the script verifies the rendered page actually shows `Round trip` returning that date and warns on mismatch.
+- **Batch date sweep (max 3 days)**: `--sweep-days 3` scans N consecutive days from the first `--dates` value; values outside 1..3 are rejected.
+- **Cabin**: `--cabin biz` switches to Business (default `eco`); the price sanity ceiling rises from 5000 to 30000 for `biz`.
+- **Built-in airline map**: recognizes 16 carriers (AS/DL/AA/WN/UA/B6/F9/NK/AC/BA/JL/HA/SY/G4/XP/LH), no need to edit a `UID` dict.
+- **Dedup + layover parsing**: identical (price, dep, route, dur) cards are deduped; connecting flights report the layover airport (`via PHX`).
+- **JSON output** keyed by date, each with `trip`, `return`, `cabin`, and sorted `morning` list.
+
+Usage:
+```
+python gf_sweep_v2.py --origin SFO --dest SEA --cutoff 12:00 \
+    --dates 2027-03-03 2027-03-05 2027-03-07 --out out.json
+python gf_sweep_v2.py --dates 2027-03-03 --return 2027-03-10 --cutoff 10:00
+python gf_sweep_v2.py --dates 2027-03-03 --sweep-days 3 --cutoff 11:00
+python gf_sweep_v2.py --dates 2027-03-03 --sweep-days 3 --return 2027-03-10
+```
 
 ## Gotchas
+- **Trip type trap**: a query with `on <date>` but no explicit `return`/`one way` is treated as a round trip by Google Flights, which auto-picks a return date (observed: +4 days). The scraped prices are round-trip fares, approximately double one-way. Always state the trip type in the URL and verify it on the rendered page before reporting.
 - **Timing**: Google Flights renders slowly. Always `wait_for_timeout` after navigation (~9s) and after cabin switches (~10s) before parsing.
 - **No results**: check the body text for "No results ... found" and skip that query rather than parsing empty cards.
 - **Anti-bot**: keep the real UA, hide `navigator.webdriver`, and use `headless=True`. If results stop appearing, retry or add small delays.
